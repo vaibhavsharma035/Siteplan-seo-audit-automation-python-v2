@@ -1,0 +1,6 @@
+pandas
+requests
+beautifulsoup4
+keyboard
+openpyxl
+urllib3
