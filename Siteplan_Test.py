@@ -2,12 +2,14 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import time
+import random
 import threading
 import keyboard
 from datetime import datetime
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import urllib3
 
 # Disable SSL warnings
@@ -18,7 +20,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # CONFIGURATION
 # ==========================================================
 
-INPUT_FILE  = "Brien1.xlsx"
+INPUT_FILE  = "NuvoMind.xlsx"
 SHEET_NAME  = "Ops Center"
 
 REQUIRED_COLUMNS = [
@@ -30,6 +32,10 @@ REQUIRED_COLUMNS = [
 
 REQUEST_TIMEOUT = 15
 DELAY_BETWEEN_REQUESTS = 1
+
+# ── Retry / cache-buster settings ─────────────────────────
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 4  # seconds, multiplied by attempt number
 
 
 # ==========================================================
@@ -140,6 +146,81 @@ def clean_text(text):
 
 
 # ==========================================================
+# HELPER — cache-busting + retry logic
+# ==========================================================
+
+def add_cache_buster(url):
+    """
+    Append a unique query param so CDNs/proxies/browser-level caches
+    don't serve a stale copy of the page. Preserves any existing
+    query string on the URL.
+    """
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query))
+    query["_cb"] = str(int(time.time() * 1000)) + str(random.randint(1000, 9999))
+    new_query = urlencode(query)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+
+def fetch_with_retry(session, url, timeout, max_retries=MAX_RETRIES):
+    """
+    Fetches a URL with cache-busting and retry logic.
+
+    - Adds a unique query string on every attempt to bypass CDN /
+      reverse-proxy caching (fixes stale-cache FAILs).
+    - Retries on 429 (rate limit), respecting Retry-After if present.
+    - Retries on 404, since some pages briefly 404 during redirects
+      or WAF challenges even though the page is actually live.
+    - Retries on timeout / SSL / connection errors with backoff.
+
+    Returns (response, None) on success, or (None, exception) on
+    exhausted retries.
+    """
+    last_exception = None
+
+    for attempt in range(1, max_retries + 1):
+
+        busted_url = add_cache_buster(url)
+
+        try:
+            response = session.get(
+                busted_url,
+                timeout=timeout,
+                verify=False,
+                allow_redirects=True
+            )
+
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    wait_time = int(retry_after)
+                else:
+                    wait_time = RETRY_BACKOFF_BASE * attempt
+                print(f"  429 received. Waiting {wait_time}s before retry {attempt}/{max_retries}...")
+                time.sleep(wait_time)
+                continue
+
+            if response.status_code == 404 and attempt < max_retries:
+                wait_time = RETRY_BACKOFF_BASE * attempt
+                print(f"  404 received. Retrying in {wait_time}s ({attempt}/{max_retries})...")
+                time.sleep(wait_time)
+                continue
+
+            return response, None
+
+        except (requests.exceptions.Timeout,
+                requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError) as e:
+
+            last_exception = e
+            wait_time = RETRY_BACKOFF_BASE * attempt
+            print(f"  Request error ({type(e).__name__}). Retrying in {wait_time}s ({attempt}/{max_retries})...")
+            time.sleep(wait_time)
+
+    return None, last_exception
+
+
+# ==========================================================
 # LOAD DATA
 # ==========================================================
 
@@ -150,7 +231,41 @@ print(f"Input File  : {INPUT_FILE}")
 print(f"Sheet       : {SHEET_NAME}")
 print("=" * 80)
 
-df = pd.read_excel(INPUT_FILE, sheet_name=SHEET_NAME, header=1)
+
+def find_header_row(file_path, sheet_name, required_columns, max_scan_rows=10):
+    """
+    Scans the first `max_scan_rows` rows of the sheet (with no header
+    assumed) to find which row actually contains all of REQUIRED_COLUMNS.
+    Returns the 0-indexed row number to pass as header= to read_excel,
+    or None if no matching row was found.
+    """
+    raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None, nrows=max_scan_rows)
+
+    for row_idx in range(len(raw)):
+        row_values = raw.iloc[row_idx].astype(str).str.strip().tolist()
+        if all(col in row_values for col in required_columns):
+            return row_idx
+
+    return None
+
+
+header_row = find_header_row(INPUT_FILE, SHEET_NAME, REQUIRED_COLUMNS)
+
+if header_row is None:
+    # Couldn't find it automatically — show the first several rows so the
+    # user can see the exact header text and fix REQUIRED_COLUMNS.
+    print("\nCould NOT auto-detect the header row. Here are the first 10 rows of the sheet:")
+    preview = pd.read_excel(INPUT_FILE, sheet_name=SHEET_NAME, header=None, nrows=10)
+    for i, r in preview.iterrows():
+        print(f"Row {i}: {r.tolist()}")
+    raise SystemExit(
+        "\nUpdate REQUIRED_COLUMNS to match the exact header text shown above, "
+        "or set the header row manually."
+    )
+
+print(f"\nDetected header row at Excel row index: {header_row}")
+
+df = pd.read_excel(INPUT_FILE, sheet_name=SHEET_NAME, header=header_row)
 
 df.columns = df.columns.astype(str).str.strip()
 
@@ -194,7 +309,9 @@ session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36"
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache"
 })
 
 
@@ -229,12 +346,13 @@ for index, row in df.iterrows():
 
     try:
 
-        response = session.get(
-            url,
-            timeout=REQUEST_TIMEOUT,
-            verify=False,
-            allow_redirects=True
-        )
+        response, fetch_error = fetch_with_retry(session, url, REQUEST_TIMEOUT)
+
+        if fetch_error is not None:
+            raise fetch_error
+
+        if response is None:
+            raise Exception("Max retries exceeded")
 
         status_code = response.status_code
 
