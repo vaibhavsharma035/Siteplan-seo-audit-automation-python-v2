@@ -20,7 +20,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # CONFIGURATION
 # ==========================================================
 
-INPUT_FILE  = "NuvoMind.xlsx"
+INPUT_FILE  = "SiteplanSheetName.xlsx"
 SHEET_NAME  = "Ops Center"
 
 REQUIRED_COLUMNS = [
