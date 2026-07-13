@@ -21,14 +21,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 st.set_page_config(page_title="Siteplan SEO Checker", layout="wide")
 
 # ==========================================================
-# DEFAULT CONFIGURATION (adjustable in the sidebar)
+# DEFAULTS
 # ==========================================================
-REQUIRED_COLUMNS = [
-    "42Works - Staging Site Link",
-    "New H1",
-    "Live Title Tag",
-    "Live Meta Description"
-]
+# Used only as a best-guess when auto-selecting dropdown defaults below —
+# not a hard requirement anymore, since columns are now chosen in the UI.
+DEFAULT_COLUMN_GUESSES = {
+    "url": "42Works - Staging Site Link",
+    "h1": "New H1",
+    "title": "Live Title Tag",
+    "meta": "Live Meta Description",
+}
 
 DEFAULT_TIMEOUT = 15
 DEFAULT_DELAY = 1
@@ -131,82 +133,144 @@ def fetch_with_retry(session, url, timeout, max_retries, log_fn):
     return None, last_exception
 
 
-def find_header_row(file_bytes, sheet_name, required_columns, max_scan_rows=10):
+def guess_header_row(file_bytes, sheet_name, expected_values, max_scan_rows=10):
+    """
+    Best-effort auto-detect of which row holds the column headers, by
+    looking for a row that contains most of the DEFAULT_COLUMN_GUESSES
+    values. Falls back to row 0 if nothing matches well.
+    """
     raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=None, nrows=max_scan_rows)
+    best_row, best_score = 0, -1
+
     for row_idx in range(len(raw)):
         row_values = raw.iloc[row_idx].astype(str).str.strip().tolist()
-        if all(col in row_values for col in required_columns):
-            return row_idx
-    return None
+        score = sum(1 for v in expected_values if v in row_values)
+        if score > best_score:
+            best_row, best_score = row_idx, score
+
+    return best_row
+
+
+def best_match_index(columns, guess):
+    """Return the index of `guess` in `columns` if present, else 0."""
+    if guess in columns:
+        return columns.index(guess)
+    return 0
 
 
 # ==========================================================
-# UI — SIDEBAR SETTINGS
+# UI — HEADER
 # ==========================================================
 st.title("🔍 Siteplan SEO Checker")
-st.caption("Upload an Ops Center sheet, run the H1 / Title / Meta check against staging URLs, and download a color-coded results workbook.")
+st.caption("Upload a sheet, map your columns, run the H1 / Title / Meta check against staging URLs, and download a color-coded results workbook.")
 
 with st.sidebar:
-    st.header("Settings")
-    sheet_name = st.text_input("Sheet name", value="Ops Center")
+    st.header("Run settings")
     request_timeout = st.number_input("Request timeout (seconds)", min_value=5, max_value=60, value=DEFAULT_TIMEOUT)
     delay_between_requests = st.number_input("Delay between requests (seconds)", min_value=0.0, max_value=10.0, value=float(DEFAULT_DELAY), step=0.5)
     max_retries = st.number_input("Max retries per URL", min_value=1, max_value=5, value=DEFAULT_MAX_RETRIES)
-    st.markdown("---")
-    st.caption("Required columns in your sheet:")
-    for col in REQUIRED_COLUMNS:
-        st.caption(f"• {col}")
     st.markdown("---")
     st.caption("To stop a run in progress, use the ⏹ stop control Streamlit shows at the top of the page while the script is executing.")
 
 uploaded_file = st.file_uploader("Upload your Excel file (.xlsx)", type=["xlsx"])
 
-run_clicked = st.button("▶ Run SEO Check", type="primary", disabled=uploaded_file is None)
+if uploaded_file is not None:
+    file_bytes = uploaded_file.getvalue()
+    source_name = Path(uploaded_file.name).stem
+
+    # ── Sheet selection ───────────────────────────────────
+    try:
+        workbook_preview = pd.ExcelFile(io.BytesIO(file_bytes))
+        sheet_names = workbook_preview.sheet_names
+    except Exception as e:
+        st.error(f"Could not read this file as an Excel workbook: {e}")
+        st.stop()
+
+    default_sheet_index = sheet_names.index("Ops Center") if "Ops Center" in sheet_names else 0
+    sheet_name = st.selectbox("Sheet", options=sheet_names, index=default_sheet_index)
+
+    # ── Header row selection ──────────────────────────────
+    auto_row = guess_header_row(file_bytes, sheet_name, list(DEFAULT_COLUMN_GUESSES.values()))
+    header_row = st.number_input(
+        "Header row (0 = first row of the sheet)",
+        min_value=0, max_value=20, value=auto_row,
+        help="The row number where your column titles actually appear. Auto-detected as a starting guess — adjust if it looks wrong."
+    )
+
+    try:
+        df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=header_row)
+        df_raw.columns = df_raw.columns.astype(str).str.strip()
+    except Exception as e:
+        st.error(f"Could not read the sheet with that header row: {e}")
+        st.stop()
+
+    available_columns = df_raw.columns.tolist()
+
+    with st.expander("Preview of detected columns and first rows", expanded=False):
+        st.write("Columns found:", available_columns)
+        st.dataframe(df_raw.head(5))
+
+    # ── Column mapping ─────────────────────────────────────
+    st.subheader("Map your columns")
+    st.caption("Tell the checker which column in your sheet holds each piece of data.")
+
+    map_col1, map_col2 = st.columns(2)
+
+    with map_col1:
+        url_column = st.selectbox(
+            "Staging URL column",
+            options=available_columns,
+            index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["url"])
+        )
+        h1_column = st.selectbox(
+            "Expected H1 column",
+            options=available_columns,
+            index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["h1"])
+        )
+
+    with map_col2:
+        title_column = st.selectbox(
+            "Expected Title column",
+            options=available_columns,
+            index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["title"])
+        )
+        meta_column = st.selectbox(
+            "Expected Meta Description column",
+            options=available_columns,
+            index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["meta"])
+        )
+
+    selected_columns = [url_column, h1_column, title_column, meta_column]
+    mapping_has_duplicates = len(set(selected_columns)) != len(selected_columns)
+
+    if mapping_has_duplicates:
+        st.warning("You've mapped the same column to more than one field — double check your selections.")
+
+    run_clicked = st.button("▶ Run SEO Check", type="primary", disabled=mapping_has_duplicates)
+
+else:
+    run_clicked = False
+    st.info("Upload an Excel file to get started.")
 
 # ==========================================================
 # MAIN EXECUTION
 # ==========================================================
-if run_clicked and uploaded_file is not None:
+if uploaded_file is not None and run_clicked:
 
-    file_bytes = uploaded_file.getvalue()
-    source_name = Path(uploaded_file.name).stem
-
-    log_box = st.empty()
-    log_lines = []
-
-    def log(msg):
-        log_lines.append(msg)
-        # Keep the log box readable — show the last ~40 lines
-        log_box.code("\n".join(log_lines[-40:]))
-
-    log(f"Input File : {uploaded_file.name}")
-    log(f"Sheet      : {sheet_name}")
-
-    header_row = find_header_row(file_bytes, sheet_name, REQUIRED_COLUMNS)
-
-    if header_row is None:
-        st.error("Could NOT auto-detect the header row. Here are the first 10 rows of the sheet:")
-        preview = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=None, nrows=10)
-        st.dataframe(preview)
-        st.stop()
-
-    log(f"Detected header row at Excel row index: {header_row}")
-
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=header_row)
-    df.columns = df.columns.astype(str).str.strip()
-
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        st.error(f"Missing required column(s): {missing}")
-        st.write("Found columns:", df.columns.tolist())
-        st.stop()
-
-    df = df[REQUIRED_COLUMNS]
+    df = df_raw[[url_column, h1_column, title_column, meta_column]].copy()
     df.columns = ["URL", "Expected_H1", "Expected_Title", "Expected_Meta"]
     df = df[df["URL"].notna()].reset_index(drop=True)
 
     total_urls = len(df)
-    log(f"Total URLs to check : {total_urls}")
+
+    log_box = st.empty()
+    log_lines = [f"Input File : {uploaded_file.name}", f"Sheet      : {sheet_name}", f"Total URLs : {total_urls}"]
+
+    def log(msg):
+        log_lines.append(msg)
+        log_box.code("\n".join(log_lines[-40:]))
+
+    log_box.code("\n".join(log_lines))
 
     df["Status_Code"] = ""
     df["Actual_H1"] = ""
@@ -382,9 +446,11 @@ if run_clicked and uploaded_file is not None:
     for row_num in range(2, ws.max_row + 1):
         for col_name in result_columns:
             if col_name in col_map:
-                apply_cell_style(ws.cell(row=row_num, column=col_map[col_name]), ws.cell(row=row_num, column=col_map[col_name]).value)
+                cell = ws.cell(row=row_num, column=col_map[col_name])
+                apply_cell_style(cell, cell.value)
         if status_column in col_map:
-            apply_status_style(ws.cell(row=row_num, column=col_map[status_column]), ws.cell(row=row_num, column=col_map[status_column]).value)
+            cell = ws.cell(row=row_num, column=col_map[status_column])
+            apply_status_style(cell, cell.value)
 
     output_buffer = io.BytesIO()
     wb.save(output_buffer)
