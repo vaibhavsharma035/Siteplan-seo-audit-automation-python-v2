@@ -68,7 +68,7 @@ color-coded results workbook.
 2. Update the configuration constants at the top of the script if needed:
 
    ```python
-   INPUT_FILE  = "Brien1.xlsx"
+   INPUT_FILE  = "SheetName.xlsx"
    SHEET_NAME  = "Ops Center"
    ```
 
