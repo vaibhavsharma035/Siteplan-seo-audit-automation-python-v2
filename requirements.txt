@@ -3,8 +3,8 @@ requests
 beautifulsoup4
 openpyxl
 
-# Required only for Siteplan_Test_Final.py (local/CLI version - ESC-to-stop listener)
-keyboard
 
-# Required only for streamlit_app.py (browser version)
-streamlit
+keyboard     # Required only for Siteplan_Test_Final.py (local/CLI version - ESC-to-stop listener)
+
+
+streamlit    # Required only for streamlit_app.py (browser version)
