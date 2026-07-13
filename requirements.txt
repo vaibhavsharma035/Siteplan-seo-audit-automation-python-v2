@@ -2,9 +2,5 @@ pandas
 requests
 beautifulsoup4
 openpyxl
-
-
 keyboard     # Required only for Siteplan_Test_Final.py (local/CLI version - ESC-to-stop listener)
-
-
 streamlit    # Required only for streamlit_app.py (browser version)
