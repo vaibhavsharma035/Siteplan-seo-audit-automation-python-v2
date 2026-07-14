@@ -56,7 +56,7 @@ FAIL_VALUES = {"FAIL"}
 WARN_VALUES = {"MULTIPLE H1", "H1 MISSING", "TITLE MISSING", "META MISSING",
                "NO EXPECTED H1", "NO EXPECTED TITLE", "NO EXPECTED META"}
 HTTP_ERR_CODES = {"404", "403", "500", "502", "503", "301", "302"}
-ERROR_VALUES = {"ERROR", "META ERROR"}
+ERROR_VALUES = {"ERROR"}
 
 
 def apply_cell_style(cell, value):
@@ -158,67 +158,6 @@ def best_match_index(columns, guess):
     return 0
 
 
-def build_formatted_workbook(df):
-    """
-    Writes df to an in-memory .xlsx and applies the standard navy-header,
-    frozen-row, auto-width, color-coded formatting. Returns a BytesIO
-    ready for st.download_button.
-    """
-    excel_buffer = io.BytesIO()
-    df.to_excel(excel_buffer, index=False)
-    excel_buffer.seek(0)
-
-    wb = load_workbook(excel_buffer)
-    ws = wb.active
-
-    col_map = {}
-    for cell in ws[1]:
-        if cell.value:
-            col_map[str(cell.value).strip()] = cell.column
-
-    result_columns = ["H1_Result", "Title_Result", "Meta_Result"]
-    status_column = "Status_Code"
-
-    header_fill = PatternFill(fill_type="solid", fgColor="1F3864")
-    header_font = Font(color="FFFFFF", bold=True, size=11)
-    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    header_border = Border(bottom=Side(style="medium", color="FFFFFF"))
-
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = header_align
-        cell.border = header_border
-
-    ws.freeze_panes = "A2"
-    ws.row_dimensions[1].height = 35
-
-    for col in ws.columns:
-        max_length = 0
-        col_letter = col[0].column_letter
-        for cell in col:
-            try:
-                if cell.value:
-                    max_length = max(max_length, len(str(cell.value)))
-            except Exception:
-                pass
-        ws.column_dimensions[col_letter].width = min(max(max_length + 2, 3), 16)
-
-    for row_num in range(2, ws.max_row + 1):
-        for col_name in result_columns:
-            if col_name in col_map:
-                cell = ws.cell(row=row_num, column=col_map[col_name])
-                apply_cell_style(cell, cell.value)
-        if status_column in col_map:
-            cell = ws.cell(row=row_num, column=col_map[status_column])
-            apply_status_style(cell, cell.value)
-
-    output_buffer = io.BytesIO()
-    wb.save(output_buffer)
-    output_buffer.seek(0)
-    return output_buffer
-
-
 # ==========================================================
 # UI — HEADER
 # ==========================================================
@@ -232,9 +171,9 @@ with st.sidebar:
     max_retries = st.number_input("Max retries per URL", min_value=1, max_value=5, value=DEFAULT_MAX_RETRIES)
     st.markdown("---")
     st.caption(
-        "To stop a run in progress, use the ⏹ stop control Streamlit shows at the "
-        "top of the page while the script is executing. Whatever URLs were already "
-        "processed will still be available to download below."
+        "A run can't be safely paused and resumed — closing or refreshing "
+        "this tab stops it, and nothing processed so far will be saved. "
+        "For very large sheets, consider checking them in smaller batches."
     )
 
 uploaded_file = st.file_uploader("Upload your Excel file (.xlsx)", type=["xlsx"])
@@ -357,154 +296,205 @@ if uploaded_file is not None and run_clicked:
     })
 
     pass_count = fail_count = warn_count = error_count = 0
-    processed_count = 0
-    loop_completed = False
 
     progress_bar = st.progress(0.0)
-    status_placeholder = st.empty()
+    # Live per-URL detail panel — mirrors what you'd see in a local
+    # terminal run (Status / H1 Result / Title / Meta for the URL
+    # currently being processed), rendered in a monospace block that
+    # updates in place each iteration.
+    detail_placeholder = st.empty()
 
-    # ── Main loop, wrapped so that a stop (via Streamlit's own ⏹
-    # control, or any unexpected error) still lets us build and offer
-    # a download of whatever was processed up to that point. ──────
-    try:
-        for index, row in df.iterrows():
+    for index, row in df.iterrows():
 
-            url = row["URL"]
-            expected_h1 = clean_text(row["Expected_H1"])
-            expected_title = clean_text(row["Expected_Title"])
-            expected_meta = clean_text(row["Expected_Meta"])
+        url = row["URL"]
+        expected_h1 = clean_text(row["Expected_H1"])
+        expected_title = clean_text(row["Expected_Title"])
+        expected_meta = clean_text(row["Expected_Meta"])
 
-            status_placeholder.write(f"Processing {index + 1} / {total_urls}: {url}")
+        detail_placeholder.code(f"Processing : {index + 1} / {total_urls}\nURL        : {url}")
 
-            try:
-                response, fetch_error = fetch_with_retry(session, url, request_timeout, max_retries, log)
+        try:
+            response, fetch_error = fetch_with_retry(session, url, request_timeout, max_retries, log)
 
-                if fetch_error is not None:
-                    raise fetch_error
-                if response is None:
-                    raise Exception("Max retries exceeded")
+            if fetch_error is not None:
+                raise fetch_error
+            if response is None:
+                raise Exception("Max retries exceeded")
 
-                status_code = response.status_code
-                soup = BeautifulSoup(response.text, "html.parser")
+            status_code = response.status_code
+            soup = BeautifulSoup(response.text, "html.parser")
 
-                h1_tags = soup.find_all("h1")
-                h1_count = len(h1_tags)
-                actual_h1 = clean_text(h1_tags[0].get_text()) if h1_count > 0 else ""
+            h1_tags = soup.find_all("h1")
+            h1_count = len(h1_tags)
+            actual_h1 = clean_text(h1_tags[0].get_text()) if h1_count > 0 else ""
 
-                actual_title = clean_text(soup.title.get_text()) if soup.title else ""
+            actual_title = clean_text(soup.title.get_text()) if soup.title else ""
 
-                meta_tag = soup.find("meta", attrs={"name": "description"})
-                if not meta_tag:
-                    meta_tag = soup.find("meta", attrs={"property": "og:description"})
-                actual_meta = clean_text(meta_tag.get("content")) if meta_tag and meta_tag.get("content") else ""
+            meta_tag = soup.find("meta", attrs={"name": "description"})
+            if not meta_tag:
+                meta_tag = soup.find("meta", attrs={"property": "og:description"})
+            actual_meta = clean_text(meta_tag.get("content")) if meta_tag and meta_tag.get("content") else ""
 
-            except requests.exceptions.Timeout:
-                log(f"TIMEOUT : {url}")
-                status_code, actual_h1, actual_title, actual_meta, h1_count = "ERROR", "", "", "", 0
+        except requests.exceptions.Timeout:
+            log(f"TIMEOUT : {url}")
+            status_code, actual_h1, actual_title, actual_meta, h1_count = "ERROR", "", "", "", 0
 
-            except requests.exceptions.SSLError:
-                log(f"SSL ERROR : {url}")
-                status_code, actual_h1, actual_title, actual_meta, h1_count = "ERROR", "", "", "", 0
+        except requests.exceptions.SSLError:
+            log(f"SSL ERROR : {url}")
+            status_code, actual_h1, actual_title, actual_meta, h1_count = "ERROR", "", "", "", 0
 
-            except Exception as e:
-                log(f"ERROR : {url} | {e}")
-                status_code, actual_h1, actual_title, actual_meta, h1_count = "ERROR", "", "", "", 0
+        except Exception as e:
+            log(f"ERROR : {url} | {e}")
+            status_code, actual_h1, actual_title, actual_meta, h1_count = "ERROR", "", "", "", 0
 
-            df.at[index, "Status_Code"] = str(status_code)
-            df.at[index, "Actual_H1"] = actual_h1
-            df.at[index, "H1_Count"] = h1_count
-            df.at[index, "Actual_Title"] = actual_title
-            df.at[index, "Actual_Meta"] = actual_meta
-            df.at[index, "Checked_At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df.at[index, "Status_Code"] = str(status_code)
+        df.at[index, "Actual_H1"] = actual_h1
+        df.at[index, "H1_Count"] = h1_count
+        df.at[index, "Actual_Title"] = actual_title
+        df.at[index, "Actual_Meta"] = actual_meta
+        df.at[index, "Checked_At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            if status_code == "ERROR":
-                h1_result = "ERROR"
-            elif expected_h1 == "":
-                h1_result = "NO EXPECTED H1"
-            elif actual_h1 == "":
-                h1_result = "H1 MISSING"
-            elif h1_count > 1:
-                h1_result = "MULTIPLE H1"
-            elif expected_h1.lower() == actual_h1.lower():
-                h1_result = "PASS"
-            else:
-                h1_result = "FAIL"
-
-            if status_code == "ERROR":
-                title_result = "ERROR"
-            elif expected_title == "":
-                title_result = "NO EXPECTED TITLE"
-            elif actual_title == "":
-                title_result = "TITLE MISSING"
-            elif expected_title.lower() == actual_title.lower():
-                title_result = "PASS"
-            else:
-                title_result = "FAIL"
-
-            if status_code == "ERROR":
-                meta_result = "ERROR"
-            elif expected_meta == "":
-                meta_result = "NO EXPECTED META"
-            elif actual_meta == "":
-                meta_result = "META MISSING"
-            elif expected_meta.lower() == actual_meta.lower():
-                meta_result = "PASS"
-            else:
-                meta_result = "FAIL"
-
-            df.at[index, "H1_Result"] = h1_result
-            df.at[index, "Title_Result"] = title_result
-            df.at[index, "Meta_Result"] = meta_result
-
-            row_results = [h1_result, title_result, meta_result]
-            if "FAIL" in row_results:
-                fail_count += 1
-            elif status_code == "ERROR":
-                error_count += 1
-            elif any(r in WARN_VALUES for r in row_results):
-                warn_count += 1
-            else:
-                pass_count += 1
-
-            processed_count += 1
-            progress_bar.progress((index + 1) / total_urls)
-            time.sleep(delay_between_requests)
-
-        loop_completed = True
-
-    finally:
-        # This block runs whether the loop finished all URLs, was
-        # interrupted by Streamlit's own stop control, or hit an
-        # unexpected error — so a download is always available for
-        # whatever was processed so far.
-
-        if loop_completed:
-            status_placeholder.write("Done processing all URLs.")
+        if status_code == "ERROR":
+            h1_result = "ERROR"
+        elif expected_h1 == "":
+            h1_result = "NO EXPECTED H1"
+        elif actual_h1 == "":
+            h1_result = "H1 MISSING"
+        elif h1_count > 1:
+            h1_result = "MULTIPLE H1"
+        elif expected_h1.lower() == actual_h1.lower():
+            h1_result = "PASS"
         else:
-            status_placeholder.warning(
-                f"Run stopped early. {processed_count} of {total_urls} URLs were processed "
-                "— partial results are ready to download below."
-            )
+            h1_result = "FAIL"
 
-        output_buffer = build_formatted_workbook(df)
+        if status_code == "ERROR":
+            title_result = "ERROR"
+        elif expected_title == "":
+            title_result = "NO EXPECTED TITLE"
+        elif actual_title == "":
+            title_result = "TITLE MISSING"
+        elif expected_title.lower() == actual_title.lower():
+            title_result = "PASS"
+        else:
+            title_result = "FAIL"
 
-        st.success("Results ready." if loop_completed else "Partial results ready.")
+        if status_code == "ERROR":
+            meta_result = "ERROR"
+        elif expected_meta == "":
+            meta_result = "NO EXPECTED META"
+        elif actual_meta == "":
+            meta_result = "META MISSING"
+        elif expected_meta.lower() == actual_meta.lower():
+            meta_result = "PASS"
+        else:
+            meta_result = "FAIL"
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Passed", pass_count)
-        c2.metric("Failed", fail_count)
-        c3.metric("Warnings", warn_count)
-        c4.metric("Errors", error_count)
+        df.at[index, "H1_Result"] = h1_result
+        df.at[index, "Title_Result"] = title_result
+        df.at[index, "Meta_Result"] = meta_result
 
-        status_suffix = "SEO_Result_001" if loop_completed else f"SEO_Result_PARTIAL_{processed_count}of{total_urls}"
-        output_filename = f"{source_name}_{status_suffix}.xlsx"
-
-        st.download_button(
-            label="⬇ Download Results (.xlsx)" if loop_completed else "⬇ Download Partial Results (.xlsx)",
-            data=output_buffer,
-            file_name=output_filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        # Fill in the same panel with the full per-field result for this
+        # URL, once processing for it has finished — same info as the
+        # local script's terminal output.
+        detail_placeholder.code(
+            f"Processing : {index + 1} / {total_urls}\n"
+            f"URL        : {url}\n"
+            f"Status     : {status_code}\n"
+            f"H1 Result  : {h1_result}  (count: {h1_count})\n"
+            f"Title      : {title_result}\n"
+            f"Meta       : {meta_result}"
         )
 
-        with st.expander("View results table"):
-            st.dataframe(df)
+        row_results = [h1_result, title_result, meta_result]
+        if "FAIL" in row_results:
+            fail_count += 1
+        elif status_code == "ERROR":
+            error_count += 1
+        elif any(r in WARN_VALUES for r in row_results):
+            warn_count += 1
+        else:
+            pass_count += 1
+
+        progress_bar.progress((index + 1) / total_urls)
+        time.sleep(delay_between_requests)
+
+    detail_placeholder.code("Done processing all URLs.")
+
+    # ==========================================================
+    # BUILD FORMATTED OUTPUT WORKBOOK (in memory)
+    # ==========================================================
+    excel_buffer = io.BytesIO()
+    df.to_excel(excel_buffer, index=False)
+    excel_buffer.seek(0)
+
+    wb = load_workbook(excel_buffer)
+    ws = wb.active
+
+    col_map = {}
+    for cell in ws[1]:
+        if cell.value:
+            col_map[str(cell.value).strip()] = cell.column
+
+    result_columns = ["H1_Result", "Title_Result", "Meta_Result"]
+    status_column = "Status_Code"
+
+    HEADER_FILL = PatternFill(fill_type="solid", fgColor="1F3864")
+    HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
+    HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    HEADER_BORDER = Border(bottom=Side(style="medium", color="FFFFFF"))
+
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = HEADER_ALIGN
+        cell.border = HEADER_BORDER
+
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 35
+
+    for col in ws.columns:
+        max_length = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max(max_length + 2, 3), 16)
+
+    for row_num in range(2, ws.max_row + 1):
+        for col_name in result_columns:
+            if col_name in col_map:
+                cell = ws.cell(row=row_num, column=col_map[col_name])
+                apply_cell_style(cell, cell.value)
+        if status_column in col_map:
+            cell = ws.cell(row=row_num, column=col_map[status_column])
+            apply_status_style(cell, cell.value)
+
+    output_buffer = io.BytesIO()
+    wb.save(output_buffer)
+    output_buffer.seek(0)
+
+    # ==========================================================
+    # SUMMARY + DOWNLOAD
+    # ==========================================================
+    st.success("SEO check completed.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Passed", pass_count)
+    c2.metric("Failed", fail_count)
+    c3.metric("Warnings", warn_count)
+    c4.metric("Errors", error_count)
+
+    output_filename = f"{source_name}_SEO_Result_001.xlsx"
+
+    st.download_button(
+        label="⬇ Download Results (.xlsx)",
+        data=output_buffer,
+        file_name=output_filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    with st.expander("View results table"):
+        st.dataframe(df)
