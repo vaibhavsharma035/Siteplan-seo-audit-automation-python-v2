@@ -1,10 +1,6 @@
 import io
-import re
 import time
-import random
 from datetime import datetime
-from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import pandas as pd
 import requests
@@ -13,6 +9,14 @@ from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 import urllib3
+
+from shared_utils import (
+    fetch_with_retry,
+    guess_header_row,
+    best_match_index,
+    new_requests_session,
+    build_data_source_ui,
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -36,9 +40,6 @@ DEFAULT_COLUMN_GUESSES = {
 DEFAULT_TIMEOUT = 15
 DEFAULT_DELAY = 1
 DEFAULT_MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 4
-
-GOOGLE_SHEET_ID_PATTERN = re.compile(r"/spreadsheets/d/([a-zA-Z0-9-_]+)")
 
 # ==========================================================
 # COLORS
@@ -91,110 +92,6 @@ def clean_text(text):
     return " ".join(str(text).replace("\n", " ").replace("\r", " ").split()).strip()
 
 
-def add_cache_buster(url):
-    parts = urlsplit(url)
-    query = dict(parse_qsl(parts.query))
-    query["_cb"] = str(int(time.time() * 1000)) + str(random.randint(1000, 9999))
-    new_query = urlencode(query)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
-
-
-def fetch_with_retry(session, url, timeout, max_retries, log_fn):
-    last_exception = None
-
-    for attempt in range(1, max_retries + 1):
-        busted_url = add_cache_buster(url)
-
-        try:
-            response = session.get(
-                busted_url, timeout=timeout, verify=False, allow_redirects=True
-            )
-
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                wait_time = int(retry_after) if retry_after and retry_after.isdigit() else RETRY_BACKOFF_BASE * attempt
-                log_fn(f"  429 received. Waiting {wait_time}s before retry {attempt}/{max_retries}...")
-                time.sleep(wait_time)
-                continue
-
-            if response.status_code in (403, 404) and attempt < max_retries:
-                wait_time = RETRY_BACKOFF_BASE * attempt
-                log_fn(f"  {response.status_code} received. Retrying in {wait_time}s ({attempt}/{max_retries})...")
-                time.sleep(wait_time)
-                continue
-
-            return response, None
-
-        except (requests.exceptions.Timeout,
-                requests.exceptions.SSLError,
-                requests.exceptions.ConnectionError) as e:
-            last_exception = e
-            wait_time = RETRY_BACKOFF_BASE * attempt
-            log_fn(f"  Request error ({type(e).__name__}). Retrying in {wait_time}s ({attempt}/{max_retries})...")
-            time.sleep(wait_time)
-
-    return None, last_exception
-
-
-def extract_google_sheet_id(url):
-    match = GOOGLE_SHEET_ID_PATTERN.search(url)
-    return match.group(1) if match else None
-
-
-def fetch_google_sheet_as_xlsx(sheet_id, timeout=20):
-    """
-    Downloads a publicly link-shared Google Sheet as .xlsx bytes, using
-    Google's built-in export endpoint. Only works for sheets set to
-    "Anyone with the link can view" (or more open) — no login/API key
-    involved. Returns (bytes, error_message). error_message is None on
-    success.
-    """
-    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
-
-    try:
-        response = requests.get(export_url, timeout=timeout, allow_redirects=True)
-    except requests.exceptions.RequestException as e:
-        return None, f"Could not reach Google Sheets: {e}"
-
-    if response.status_code != 200:
-        return None, f"Google Sheets returned status {response.status_code}. Check the link and sharing settings."
-
-    # A valid .xlsx is a zip archive — starts with 'PK'. If Google instead
-    # returned an HTML login/permission page, this check catches it.
-    if not response.content[:2] == b"PK":
-        return None, (
-            "This doesn't look like a valid spreadsheet export. The sheet is likely "
-            "not shared as \"Anyone with the link can view\" — check its sharing settings."
-        )
-
-    return response.content, None
-
-
-def guess_header_row(file_bytes, sheet_name, expected_values, max_scan_rows=10):
-    """
-    Best-effort auto-detect of which row holds the column headers, by
-    looking for a row that contains most of the DEFAULT_COLUMN_GUESSES
-    values. Falls back to row 0 if nothing matches well.
-    """
-    raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=None, nrows=max_scan_rows)
-    best_row, best_score = 0, -1
-
-    for row_idx in range(len(raw)):
-        row_values = raw.iloc[row_idx].astype(str).str.strip().tolist()
-        score = sum(1 for v in expected_values if v in row_values)
-        if score > best_score:
-            best_row, best_score = row_idx, score
-
-    return best_row
-
-
-def best_match_index(columns, guess):
-    """Return the index of `guess` in `columns` if present, else 0."""
-    if guess in columns:
-        return columns.index(guess)
-    return 0
-
-
 # ==========================================================
 # UI — HEADER
 # ==========================================================
@@ -214,45 +111,12 @@ with st.sidebar:
     )
 
 # ==========================================================
-# DATA SOURCE — file upload OR Google Sheets link
+# DATA SOURCE — file upload OR Google Sheets link (shared_utils)
 # ==========================================================
-source_mode = st.radio(
-    "Sheet source",
-    options=["Upload Excel file (.xlsx)", "Google Sheets link"],
-    horizontal=True,
-)
-
-file_bytes = None
-source_name = None
-
-if source_mode == "Upload Excel file (.xlsx)":
-    uploaded_file = st.file_uploader("Upload your Excel file (.xlsx)", type=["xlsx"])
-    if uploaded_file is not None:
-        file_bytes = uploaded_file.getvalue()
-        source_name = Path(uploaded_file.name).stem
-
-else:
-    st.caption(
-        "Works only for sheets shared as \"Anyone with the link can view\" — "
-        "no Google login is used or required."
-    )
-    sheet_url = st.text_input("Paste the Google Sheets URL")
-    if sheet_url:
-        sheet_id = extract_google_sheet_id(sheet_url)
-        if not sheet_id:
-            st.error("That doesn't look like a Google Sheets URL. Expected a link containing '/spreadsheets/d/<id>/'.")
-        else:
-            with st.spinner("Fetching sheet from Google..."):
-                fetched_bytes, fetch_error = fetch_google_sheet_as_xlsx(sheet_id)
-            if fetch_error:
-                st.error(fetch_error)
-            else:
-                file_bytes = fetched_bytes
-                source_name = f"GoogleSheet_{sheet_id[:8]}"
-                st.success("Sheet loaded successfully.")
+file_bytes, source_name = build_data_source_ui(st, key_prefix="seo")
 
 # ==========================================================
-# SHEET / HEADER / COLUMN MAPPING (shared by both source modes)
+# SHEET / HEADER / COLUMN MAPPING
 # ==========================================================
 if file_bytes is not None:
 
@@ -356,17 +220,13 @@ else:
 # ==========================================================
 if file_bytes is not None and run_clicked:
 
-    keep_columns = ["URL"]
     rename_map = {url_column: "URL"}
     if check_h1:
         rename_map[h1_column] = "Expected_H1"
-        keep_columns.append("Expected_H1")
     if check_title:
         rename_map[title_column] = "Expected_Title"
-        keep_columns.append("Expected_Title")
     if check_meta:
         rename_map[meta_column] = "Expected_Meta"
-        keep_columns.append("Expected_Meta")
 
     df = df_raw[list(rename_map.keys())].copy()
     df.columns = [rename_map[c] for c in df.columns]
@@ -404,14 +264,7 @@ if file_bytes is not None and run_clicked:
         df["Actual_Meta"] = ""
         df["Meta_Result"] = ""
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0.0.0 Safari/537.36",
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache"
-    })
+    session = new_requests_session()
 
     pass_count = fail_count = warn_count = error_count = 0
 
