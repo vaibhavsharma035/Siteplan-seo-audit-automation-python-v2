@@ -1,4 +1,5 @@
 import io
+import re
 import time
 import random
 from datetime import datetime
@@ -36,6 +37,8 @@ DEFAULT_TIMEOUT = 15
 DEFAULT_DELAY = 1
 DEFAULT_MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 4
+
+GOOGLE_SHEET_ID_PATTERN = re.compile(r"/spreadsheets/d/([a-zA-Z0-9-_]+)")
 
 # ==========================================================
 # COLORS
@@ -133,6 +136,40 @@ def fetch_with_retry(session, url, timeout, max_retries, log_fn):
     return None, last_exception
 
 
+def extract_google_sheet_id(url):
+    match = GOOGLE_SHEET_ID_PATTERN.search(url)
+    return match.group(1) if match else None
+
+
+def fetch_google_sheet_as_xlsx(sheet_id, timeout=20):
+    """
+    Downloads a publicly link-shared Google Sheet as .xlsx bytes, using
+    Google's built-in export endpoint. Only works for sheets set to
+    "Anyone with the link can view" (or more open) — no login/API key
+    involved. Returns (bytes, error_message). error_message is None on
+    success.
+    """
+    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+
+    try:
+        response = requests.get(export_url, timeout=timeout, allow_redirects=True)
+    except requests.exceptions.RequestException as e:
+        return None, f"Could not reach Google Sheets: {e}"
+
+    if response.status_code != 200:
+        return None, f"Google Sheets returned status {response.status_code}. Check the link and sharing settings."
+
+    # A valid .xlsx is a zip archive — starts with 'PK'. If Google instead
+    # returned an HTML login/permission page, this check catches it.
+    if not response.content[:2] == b"PK":
+        return None, (
+            "This doesn't look like a valid spreadsheet export. The sheet is likely "
+            "not shared as \"Anyone with the link can view\" — check its sharing settings."
+        )
+
+    return response.content, None
+
+
 def guess_header_row(file_bytes, sheet_name, expected_values, max_scan_rows=10):
     """
     Best-effort auto-detect of which row holds the column headers, by
@@ -162,7 +199,7 @@ def best_match_index(columns, guess):
 # UI — HEADER
 # ==========================================================
 st.title("🔍 Siteplan SEO Checker")
-st.caption("Upload a sheet, map your columns, run the H1 / Title / Meta check against staging URLs, and download a color-coded results workbook.")
+st.caption("Load a sheet, choose which fields to check, map your columns, and download a color-coded results workbook.")
 
 with st.sidebar:
     st.header("Run settings")
@@ -176,18 +213,55 @@ with st.sidebar:
         "For very large sheets, consider checking them in smaller batches."
     )
 
-uploaded_file = st.file_uploader("Upload your Excel file (.xlsx)", type=["xlsx"])
+# ==========================================================
+# DATA SOURCE — file upload OR Google Sheets link
+# ==========================================================
+source_mode = st.radio(
+    "Sheet source",
+    options=["Upload Excel file (.xlsx)", "Google Sheets link"],
+    horizontal=True,
+)
 
-if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
-    source_name = Path(uploaded_file.name).stem
+file_bytes = None
+source_name = None
+
+if source_mode == "Upload Excel file (.xlsx)":
+    uploaded_file = st.file_uploader("Upload your Excel file (.xlsx)", type=["xlsx"])
+    if uploaded_file is not None:
+        file_bytes = uploaded_file.getvalue()
+        source_name = Path(uploaded_file.name).stem
+
+else:
+    st.caption(
+        "Works only for sheets shared as \"Anyone with the link can view\" — "
+        "no Google login is used or required."
+    )
+    sheet_url = st.text_input("Paste the Google Sheets URL")
+    if sheet_url:
+        sheet_id = extract_google_sheet_id(sheet_url)
+        if not sheet_id:
+            st.error("That doesn't look like a Google Sheets URL. Expected a link containing '/spreadsheets/d/<id>/'.")
+        else:
+            with st.spinner("Fetching sheet from Google..."):
+                fetched_bytes, fetch_error = fetch_google_sheet_as_xlsx(sheet_id)
+            if fetch_error:
+                st.error(fetch_error)
+            else:
+                file_bytes = fetched_bytes
+                source_name = f"GoogleSheet_{sheet_id[:8]}"
+                st.success("Sheet loaded successfully.")
+
+# ==========================================================
+# SHEET / HEADER / COLUMN MAPPING (shared by both source modes)
+# ==========================================================
+if file_bytes is not None:
 
     # ── Sheet selection ───────────────────────────────────
     try:
         workbook_preview = pd.ExcelFile(io.BytesIO(file_bytes))
         sheet_names = workbook_preview.sheet_names
     except Exception as e:
-        st.error(f"Could not read this file as an Excel workbook: {e}")
+        st.error(f"Could not read this as an Excel workbook: {e}")
         st.stop()
 
     default_sheet_index = sheet_names.index("Ops Center") if "Ops Center" in sheet_names else 0
@@ -214,7 +288,21 @@ if uploaded_file is not None:
         st.write("Columns found:", available_columns)
         st.dataframe(df_raw.head(5))
 
-    # ── Column mapping ─────────────────────────────────────
+    # ── Field selection — choose which fields to check ────
+    st.subheader("Which fields do you want to check?")
+    field_col1, field_col2, field_col3 = st.columns(3)
+    with field_col1:
+        check_h1 = st.checkbox("H1", value=True)
+    with field_col2:
+        check_title = st.checkbox("Title", value=True)
+    with field_col3:
+        check_meta = st.checkbox("Meta Description", value=True)
+
+    no_fields_selected = not (check_h1 or check_title or check_meta)
+    if no_fields_selected:
+        st.warning("Select at least one field to check.")
+
+    # ── Column mapping — only shows dropdowns for selected fields ──
     st.subheader("Map your columns")
     st.caption("Tell the checker which column in your sheet holds each piece of data.")
 
@@ -226,49 +314,76 @@ if uploaded_file is not None:
             options=available_columns,
             index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["url"])
         )
-        h1_column = st.selectbox(
-            "Expected H1 column",
-            options=available_columns,
-            index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["h1"])
-        )
+        h1_column = None
+        if check_h1:
+            h1_column = st.selectbox(
+                "Expected H1 column",
+                options=available_columns,
+                index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["h1"])
+            )
 
     with map_col2:
-        title_column = st.selectbox(
-            "Expected Title column",
-            options=available_columns,
-            index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["title"])
-        )
-        meta_column = st.selectbox(
-            "Expected Meta Description column",
-            options=available_columns,
-            index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["meta"])
-        )
+        title_column = None
+        if check_title:
+            title_column = st.selectbox(
+                "Expected Title column",
+                options=available_columns,
+                index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["title"])
+            )
+        meta_column = None
+        if check_meta:
+            meta_column = st.selectbox(
+                "Expected Meta Description column",
+                options=available_columns,
+                index=best_match_index(available_columns, DEFAULT_COLUMN_GUESSES["meta"])
+            )
 
-    selected_columns = [url_column, h1_column, title_column, meta_column]
+    selected_columns = [c for c in [url_column, h1_column, title_column, meta_column] if c is not None]
     mapping_has_duplicates = len(set(selected_columns)) != len(selected_columns)
 
     if mapping_has_duplicates:
         st.warning("You've mapped the same column to more than one field — double check your selections.")
 
-    run_clicked = st.button("▶ Run SEO Check", type="primary", disabled=mapping_has_duplicates)
+    run_disabled = mapping_has_duplicates or no_fields_selected
+    run_clicked = st.button("▶ Run SEO Check", type="primary", disabled=run_disabled)
 
 else:
     run_clicked = False
-    st.info("Upload an Excel file to get started.")
+    st.info("Upload an Excel file or paste a Google Sheets link to get started.")
 
 # ==========================================================
 # MAIN EXECUTION
 # ==========================================================
-if uploaded_file is not None and run_clicked:
+if file_bytes is not None and run_clicked:
 
-    df = df_raw[[url_column, h1_column, title_column, meta_column]].copy()
-    df.columns = ["URL", "Expected_H1", "Expected_Title", "Expected_Meta"]
+    keep_columns = ["URL"]
+    rename_map = {url_column: "URL"}
+    if check_h1:
+        rename_map[h1_column] = "Expected_H1"
+        keep_columns.append("Expected_H1")
+    if check_title:
+        rename_map[title_column] = "Expected_Title"
+        keep_columns.append("Expected_Title")
+    if check_meta:
+        rename_map[meta_column] = "Expected_Meta"
+        keep_columns.append("Expected_Meta")
+
+    df = df_raw[list(rename_map.keys())].copy()
+    df.columns = [rename_map[c] for c in df.columns]
     df = df[df["URL"].notna()].reset_index(drop=True)
 
     total_urls = len(df)
 
     log_box = st.empty()
-    log_lines = [f"Input File : {uploaded_file.name}", f"Sheet      : {sheet_name}", f"Total URLs : {total_urls}"]
+    fields_being_checked = ", ".join(
+        f for f, enabled in [("H1", check_h1), ("Title", check_title), ("Meta", check_meta)] if enabled
+    )
+    log_lines = [
+        f"Input       : {source_name}",
+        f"Sheet       : {sheet_name}",
+        f"Fields      : {fields_being_checked}",
+        f"Total URLs  : {total_urls}",
+    ]
 
     def log(msg):
         log_lines.append(msg)
@@ -277,14 +392,17 @@ if uploaded_file is not None and run_clicked:
     log_box.code("\n".join(log_lines))
 
     df["Status_Code"] = ""
-    df["Actual_H1"] = ""
-    df["H1_Count"] = 0
-    df["H1_Result"] = ""
-    df["Actual_Title"] = ""
-    df["Title_Result"] = ""
-    df["Actual_Meta"] = ""
-    df["Meta_Result"] = ""
     df["Checked_At"] = ""
+    if check_h1:
+        df["Actual_H1"] = ""
+        df["H1_Count"] = 0
+        df["H1_Result"] = ""
+    if check_title:
+        df["Actual_Title"] = ""
+        df["Title_Result"] = ""
+    if check_meta:
+        df["Actual_Meta"] = ""
+        df["Meta_Result"] = ""
 
     session = requests.Session()
     session.headers.update({
@@ -299,17 +417,15 @@ if uploaded_file is not None and run_clicked:
 
     progress_bar = st.progress(0.0)
     # Live per-URL detail panel — mirrors what you'd see in a local
-    # terminal run (Status / H1 Result / Title / Meta for the URL
-    # currently being processed), rendered in a monospace block that
-    # updates in place each iteration.
+    # terminal run, showing only the fields actually being checked.
     detail_placeholder = st.empty()
 
     for index, row in df.iterrows():
 
         url = row["URL"]
-        expected_h1 = clean_text(row["Expected_H1"])
-        expected_title = clean_text(row["Expected_Title"])
-        expected_meta = clean_text(row["Expected_Meta"])
+        expected_h1 = clean_text(row["Expected_H1"]) if check_h1 else ""
+        expected_title = clean_text(row["Expected_Title"]) if check_title else ""
+        expected_meta = clean_text(row["Expected_Meta"]) if check_meta else ""
 
         detail_placeholder.code(f"Processing : {index + 1} / {total_urls}\nURL        : {url}")
 
@@ -324,16 +440,22 @@ if uploaded_file is not None and run_clicked:
             status_code = response.status_code
             soup = BeautifulSoup(response.text, "html.parser")
 
-            h1_tags = soup.find_all("h1")
-            h1_count = len(h1_tags)
-            actual_h1 = clean_text(h1_tags[0].get_text()) if h1_count > 0 else ""
+            actual_h1, h1_count = "", 0
+            if check_h1:
+                h1_tags = soup.find_all("h1")
+                h1_count = len(h1_tags)
+                actual_h1 = clean_text(h1_tags[0].get_text()) if h1_count > 0 else ""
 
-            actual_title = clean_text(soup.title.get_text()) if soup.title else ""
+            actual_title = ""
+            if check_title:
+                actual_title = clean_text(soup.title.get_text()) if soup.title else ""
 
-            meta_tag = soup.find("meta", attrs={"name": "description"})
-            if not meta_tag:
-                meta_tag = soup.find("meta", attrs={"property": "og:description"})
-            actual_meta = clean_text(meta_tag.get("content")) if meta_tag and meta_tag.get("content") else ""
+            actual_meta = ""
+            if check_meta:
+                meta_tag = soup.find("meta", attrs={"name": "description"})
+                if not meta_tag:
+                    meta_tag = soup.find("meta", attrs={"property": "og:description"})
+                actual_meta = clean_text(meta_tag.get("content")) if meta_tag and meta_tag.get("content") else ""
 
         except requests.exceptions.Timeout:
             log(f"TIMEOUT : {url}")
@@ -348,64 +470,70 @@ if uploaded_file is not None and run_clicked:
             status_code, actual_h1, actual_title, actual_meta, h1_count = "ERROR", "", "", "", 0
 
         df.at[index, "Status_Code"] = str(status_code)
-        df.at[index, "Actual_H1"] = actual_h1
-        df.at[index, "H1_Count"] = h1_count
-        df.at[index, "Actual_Title"] = actual_title
-        df.at[index, "Actual_Meta"] = actual_meta
         df.at[index, "Checked_At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        if status_code == "ERROR":
-            h1_result = "ERROR"
-        elif expected_h1 == "":
-            h1_result = "NO EXPECTED H1"
-        elif actual_h1 == "":
-            h1_result = "H1 MISSING"
-        elif h1_count > 1:
-            h1_result = "MULTIPLE H1"
-        elif expected_h1.lower() == actual_h1.lower():
-            h1_result = "PASS"
-        else:
-            h1_result = "FAIL"
+        detail_lines = [
+            f"Processing : {index + 1} / {total_urls}",
+            f"URL        : {url}",
+            f"Status     : {status_code}",
+        ]
 
-        if status_code == "ERROR":
-            title_result = "ERROR"
-        elif expected_title == "":
-            title_result = "NO EXPECTED TITLE"
-        elif actual_title == "":
-            title_result = "TITLE MISSING"
-        elif expected_title.lower() == actual_title.lower():
-            title_result = "PASS"
-        else:
-            title_result = "FAIL"
+        h1_result = title_result = meta_result = None
 
-        if status_code == "ERROR":
-            meta_result = "ERROR"
-        elif expected_meta == "":
-            meta_result = "NO EXPECTED META"
-        elif actual_meta == "":
-            meta_result = "META MISSING"
-        elif expected_meta.lower() == actual_meta.lower():
-            meta_result = "PASS"
-        else:
-            meta_result = "FAIL"
+        if check_h1:
+            if status_code == "ERROR":
+                h1_result = "ERROR"
+            elif expected_h1 == "":
+                h1_result = "NO EXPECTED H1"
+            elif actual_h1 == "":
+                h1_result = "H1 MISSING"
+            elif h1_count > 1:
+                h1_result = "MULTIPLE H1"
+            elif expected_h1.lower() == actual_h1.lower():
+                h1_result = "PASS"
+            else:
+                h1_result = "FAIL"
 
-        df.at[index, "H1_Result"] = h1_result
-        df.at[index, "Title_Result"] = title_result
-        df.at[index, "Meta_Result"] = meta_result
+            df.at[index, "Actual_H1"] = actual_h1
+            df.at[index, "H1_Count"] = h1_count
+            df.at[index, "H1_Result"] = h1_result
+            detail_lines.append(f"H1 Result  : {h1_result}  (count: {h1_count})")
 
-        # Fill in the same panel with the full per-field result for this
-        # URL, once processing for it has finished — same info as the
-        # local script's terminal output.
-        detail_placeholder.code(
-            f"Processing : {index + 1} / {total_urls}\n"
-            f"URL        : {url}\n"
-            f"Status     : {status_code}\n"
-            f"H1 Result  : {h1_result}  (count: {h1_count})\n"
-            f"Title      : {title_result}\n"
-            f"Meta       : {meta_result}"
-        )
+        if check_title:
+            if status_code == "ERROR":
+                title_result = "ERROR"
+            elif expected_title == "":
+                title_result = "NO EXPECTED TITLE"
+            elif actual_title == "":
+                title_result = "TITLE MISSING"
+            elif expected_title.lower() == actual_title.lower():
+                title_result = "PASS"
+            else:
+                title_result = "FAIL"
 
-        row_results = [h1_result, title_result, meta_result]
+            df.at[index, "Actual_Title"] = actual_title
+            df.at[index, "Title_Result"] = title_result
+            detail_lines.append(f"Title      : {title_result}")
+
+        if check_meta:
+            if status_code == "ERROR":
+                meta_result = "ERROR"
+            elif expected_meta == "":
+                meta_result = "NO EXPECTED META"
+            elif actual_meta == "":
+                meta_result = "META MISSING"
+            elif expected_meta.lower() == actual_meta.lower():
+                meta_result = "PASS"
+            else:
+                meta_result = "FAIL"
+
+            df.at[index, "Actual_Meta"] = actual_meta
+            df.at[index, "Meta_Result"] = meta_result
+            detail_lines.append(f"Meta       : {meta_result}")
+
+        detail_placeholder.code("\n".join(detail_lines))
+
+        row_results = [r for r in [h1_result, title_result, meta_result] if r is not None]
         if "FAIL" in row_results:
             fail_count += 1
         elif status_code == "ERROR":
@@ -435,7 +563,7 @@ if uploaded_file is not None and run_clicked:
         if cell.value:
             col_map[str(cell.value).strip()] = cell.column
 
-    result_columns = ["H1_Result", "Title_Result", "Meta_Result"]
+    result_columns = [c for c in ["H1_Result", "Title_Result", "Meta_Result"] if c in df.columns]
     status_column = "Status_Code"
 
     HEADER_FILL = PatternFill(fill_type="solid", fgColor="1F3864")
