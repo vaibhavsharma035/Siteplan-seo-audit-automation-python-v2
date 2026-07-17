@@ -77,7 +77,7 @@ sidebar navigation: **SEO Checker** and **Redirect Checker**.
 
 ---
 
-## Local CLI script (`Siteplan_Test_Final.py`)
+## Local CLI script (`Siteplan_Test.py`)
 
 For offline use or environments without browser access. Covers the SEO
 check only (H1 / Title / Meta) — the same core logic as the web app's SEO
@@ -150,7 +150,7 @@ Checker page, run from the command line against a fixed local file.
 4. Run the script:
 
    ```
-   python Siteplan_Test_Final.py
+   python Siteplan_Test.py
    ```
 
 5. Output is saved as `<input-filename>_SEO_Result_001.xlsx`
