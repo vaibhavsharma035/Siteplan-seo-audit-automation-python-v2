@@ -234,22 +234,22 @@ if file_bytes is not None and run_clicked:
 
     total_urls = len(df)
 
-    log_box = st.empty()
     fields_being_checked = ", ".join(
         f for f, enabled in [("H1", check_h1), ("Title", check_title), ("Meta", check_meta)] if enabled
     )
-    log_lines = [
-        f"Input       : {source_name}",
-        f"Sheet       : {sheet_name}",
-        f"Fields      : {fields_being_checked}",
-        f"Total URLs  : {total_urls}",
-    ]
+    st.code(
+        f"Input       : {source_name}\n"
+        f"Sheet       : {sheet_name}\n"
+        f"Fields      : {fields_being_checked}\n"
+        f"Total URLs  : {total_urls}"
+    )
 
-    def log(msg):
-        log_lines.append(msg)
-        log_box.code("\n".join(log_lines[-40:]))
-
-    log_box.code("\n".join(log_lines))
+    # This box only ever shows retry activity for the URL currently being
+    # processed — it's reset at the start of each row and cleared once
+    # that row's outcome is known, so old retry messages don't pile up
+    # on screen (the outcome itself is already reflected in the detail
+    # panel below and in the final report).
+    log_box = st.empty()
 
     df["Status_Code"] = ""
     df["Checked_At"] = ""
@@ -279,6 +279,13 @@ if file_bytes is not None and run_clicked:
         expected_h1 = clean_text(row["Expected_H1"]) if check_h1 else ""
         expected_title = clean_text(row["Expected_Title"]) if check_title else ""
         expected_meta = clean_text(row["Expected_Meta"]) if check_meta else ""
+
+        # Fresh retry log for this URL only.
+        log_lines = []
+
+        def log(msg):
+            log_lines.append(msg)
+            log_box.code("\n".join(log_lines[-40:]))
 
         detail_placeholder.code(f"Processing : {index + 1} / {total_urls}\nURL        : {url}")
 
@@ -321,6 +328,12 @@ if file_bytes is not None and run_clicked:
         except Exception as e:
             log(f"ERROR : {url} | {e}")
             status_code, actual_h1, actual_title, actual_meta, h1_count = "ERROR", "", "", "", 0
+
+        # This URL is done (success or failure) — clear the transient
+        # retry log now that its outcome is captured below and in the
+        # final report. Only clear if something was actually shown.
+        if log_lines:
+            log_box.empty()
 
         df.at[index, "Status_Code"] = str(status_code)
         df.at[index, "Checked_At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
