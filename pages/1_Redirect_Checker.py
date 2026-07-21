@@ -190,20 +190,19 @@ if file_bytes is not None and run_clicked:
 
     total_urls = len(df)
 
+    st.code(
+        f"Input      : {source_name}\n"
+        f"Sheet      : {sheet_name}\n"
+        f"Total URLs : {total_urls}"
+    )
+
+    # This box only ever shows retry activity for the URL currently being
+    # processed — reset each iteration and cleared once that row's
+    # outcome is known, so old retry messages don't pile up on screen.
     log_box = st.empty()
-    log_lines = [
-        f"Input      : {source_name}",
-        f"Sheet      : {sheet_name}",
-        f"Total URLs : {total_urls}",
-    ]
-
-    def log(msg):
-        log_lines.append(msg)
-        log_box.code("\n".join(log_lines[-40:]))
-
-    log_box.code("\n".join(log_lines))
 
     df["Actual_URL"] = ""
+    df["Status_Code"] = ""
     df["Result"] = ""
     df["Remarks"] = ""
     df["Checked_At"] = ""
@@ -220,16 +219,25 @@ if file_bytes is not None and run_clicked:
         live_url = "" if pd.isna(row["Live_URL"]) else str(row["Live_URL"]).strip()
         expected_url = str(row["Expected_URL"]).strip()
 
+        # Fresh retry log for this URL only.
+        log_lines = []
+
+        def log(msg):
+            log_lines.append(msg)
+            log_box.code("\n".join(log_lines[-40:]))
+
         detail_placeholder.code(f"Processing : {index + 1} / {total_urls}\nLive URL   : {live_url}")
 
         if live_url == "":
             result, remarks = "SKIPPED", "Live URL Empty"
             actual_url = ""
+            status_code = ""
             skipped_count += 1
 
         elif is_asset_url(live_url):
             result, remarks = "SKIPPED", "Static Asset"
             actual_url = ""
+            status_code = ""
             skipped_count += 1
 
         else:
@@ -241,9 +249,19 @@ if file_bytes is not None and run_clicked:
                 if response is None:
                     raise Exception("Max retries exceeded")
 
+                status_code = response.status_code
                 actual_url = response.url
 
-                if normalize(actual_url) == normalize(expected_url):
+                if status_code >= 400:
+                    # Retries were exhausted and the page still isn't
+                    # loading successfully — this is a failure regardless
+                    # of what the final URL string happens to be. Without
+                    # this check, a 404 page that doesn't redirect
+                    # anywhere could be marked PASS just because its URL
+                    # matches the expected one.
+                    result, remarks = "FAIL", f"Live URL returned HTTP {status_code}"
+                    fail_count += 1
+                elif normalize(actual_url) == normalize(expected_url):
                     result, remarks = "PASS", "URLs Match"
                     pass_count += 1
                 else:
@@ -252,20 +270,26 @@ if file_bytes is not None and run_clicked:
 
             except requests.exceptions.Timeout:
                 log(f"TIMEOUT : {live_url}")
-                result, remarks, actual_url = "ERROR", "Timeout", ""
+                result, remarks, actual_url, status_code = "ERROR", "Timeout", "", "ERROR"
                 error_count += 1
 
             except requests.exceptions.SSLError:
                 log(f"SSL ERROR : {live_url}")
-                result, remarks, actual_url = "ERROR", "SSL Error", ""
+                result, remarks, actual_url, status_code = "ERROR", "SSL Error", "", "ERROR"
                 error_count += 1
 
             except Exception as e:
                 log(f"ERROR : {live_url} | {e}")
-                result, remarks, actual_url = "ERROR", str(e), ""
+                result, remarks, actual_url, status_code = "ERROR", str(e), "", "ERROR"
                 error_count += 1
 
+        # This URL is done — clear the transient retry log now that its
+        # outcome is captured below and in the final report.
+        if log_lines:
+            log_box.empty()
+
         df.at[index, "Actual_URL"] = actual_url
+        df.at[index, "Status_Code"] = str(status_code)
         df.at[index, "Result"] = result
         df.at[index, "Remarks"] = remarks
         df.at[index, "Checked_At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -275,6 +299,7 @@ if file_bytes is not None and run_clicked:
             f"Live URL   : {live_url}\n"
             f"Expected   : {expected_url}\n"
             f"Actual     : {actual_url}\n"
+            f"Status     : {status_code}\n"
             f"Result     : {result}  ({remarks})"
         )
 
