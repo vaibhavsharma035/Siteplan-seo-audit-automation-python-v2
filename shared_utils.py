@@ -9,6 +9,7 @@ import io
 import re
 import time
 import random
+import base64
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -144,6 +145,38 @@ def best_match_index(columns, guess):
     return 0
 
 
+def build_no_rerun_download_link(file_bytes, filename, label):
+    """
+    Returns an HTML anchor tag (for st.markdown(..., unsafe_allow_html=True))
+    that downloads a file via a base64 data URI, instead of using
+    st.download_button.
+
+    This matters specifically for mid-run checkpoint downloads:
+    st.download_button ALWAYS triggers a full Streamlit script rerun when
+    clicked — this is long-standing, documented Streamlit behavior, not a
+    bug in this app. Since a checkpoint button is rendered while the main
+    processing loop is still running, clicking a real download_button
+    would restart the whole script and abandon the in-progress run. A
+    plain HTML link with a data: URI is not a Streamlit widget at all —
+    the browser handles the download entirely client-side, so it never
+    contacts the Streamlit server and never triggers a rerun.
+
+    Only suitable for reasonably small files (this app's Excel reports
+    are small enough in practice); very large files are better served by
+    st.download_button once the run has actually finished.
+    """
+    import base64
+
+    b64 = base64.b64encode(file_bytes).decode()
+    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return (
+        f'<a href="data:{mime};base64,{b64}" download="{filename}" '
+        f'style="display:inline-block;padding:0.5em 1em;background-color:#FF4B4B;'
+        f'color:white;border-radius:0.5em;text-decoration:none;font-weight:600;">'
+        f'{label}</a>'
+    )
+
+
 def new_requests_session():
     """A requests.Session with the standard headers used across both tools."""
     session = requests.Session()
@@ -203,3 +236,30 @@ def build_data_source_ui(st, key_prefix):
                     st.success("Sheet loaded successfully.")
 
     return file_bytes, source_name
+
+
+def build_no_rerun_download_link(file_bytes, filename, label):
+    """
+    Renders a plain HTML download link instead of st.download_button.
+
+    This exists specifically because st.download_button triggers a full
+    Streamlit script rerun on every click — a known, long-standing
+    Streamlit behavior (not something we can configure away), which
+    would abandon the in-progress processing loop the moment someone
+    clicks a mid-run checkpoint download. A plain <a> tag with a
+    base64-encoded data URI downloads directly in the browser and never
+    talks back to the Streamlit server at all, so it can't trigger a
+    rerun — the loop keeps running untouched.
+
+    Only use this for MID-RUN checkpoint downloads. The final download
+    at the end of a run should still use st.download_button — a rerun
+    there is harmless since processing has already finished.
+    """
+    b64 = base64.b64encode(file_bytes).decode()
+    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return (
+        f'<a href="data:{mime};base64,{b64}" download="{filename}" '
+        f'style="display:inline-block;padding:0.5em 1em;background-color:#31333F;'
+        f'color:#FFFFFF;border-radius:0.5em;text-decoration:none;font-weight:600;">'
+        f'{label}</a>'
+    )
