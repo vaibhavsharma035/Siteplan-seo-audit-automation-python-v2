@@ -20,6 +20,7 @@ from shared_utils import (
     best_match_index,
     new_requests_session,
     build_data_source_ui,
+    build_no_rerun_download_link,
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -381,13 +382,12 @@ if file_bytes is not None and run_clicked:
         is_last_row = (index + 1) == total_urls
         if (index + 1) % checkpoint_every == 0 and not is_last_row:
             checkpoint_buffer = build_formatted_workbook(df)
-            checkpoint_placeholder.download_button(
+            checkpoint_link_html = build_no_rerun_download_link(
+                checkpoint_buffer.getvalue(),
+                filename=f"{source_name}_Redirect_Result_CHECKPOINT_{index + 1}of{total_urls}.xlsx",
                 label=f"⬇ Download progress so far ({index + 1} of {total_urls} processed)",
-                data=checkpoint_buffer,
-                file_name=f"{source_name}_Redirect_Result_CHECKPOINT_{index + 1}of{total_urls}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"checkpoint_{index}",
             )
+            checkpoint_placeholder.markdown(checkpoint_link_html, unsafe_allow_html=True)
 
         time.sleep(delay_between_requests)
 
