@@ -162,7 +162,7 @@ Checker page, run from the command line against a fixed local file.
 
 3. Your input sheet must contain these exact column headers (the script
    will automatically find the row they're on, within the first 10 rows):
-   - `42Works - Staging Site Link`
+   - `Staging Site Link`
    - `New H1`
    - `Live Title Tag`
    - `Live Meta Description`
