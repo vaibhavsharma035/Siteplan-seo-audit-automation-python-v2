@@ -160,15 +160,21 @@ with st.sidebar:
     checkpoint_every = st.number_input(
         "Checkpoint download every N URLs",
         min_value=10, max_value=1000, value=DEFAULT_CHECKPOINT_EVERY, step=10,
-        help="A downloadable snapshot of progress refreshes every N URLs. "
-             "Only the most recent one is ever shown — each new checkpoint "
-             "replaces the last. Lower this for large sheets if you want "
-             "more frequent safety snapshots."
+        help="A downloadable result file, covering everything processed "
+             "so far, refreshes every N URLs. Only the most recent one is "
+             "ever shown — each new checkpoint file replaces the last. "
+             "Lower this for large sheets if you want more frequent "
+             "checkpoints."
     )
     st.markdown("---")
     st.caption(
-        "A run can't be safely paused and resumed — closing or refreshing "
-        "this tab stops it, and nothing processed so far will be saved."
+        "Runs can't be paused or resumed manually — closing or refreshing "
+        "this tab stops it. But every N URLs (set above), a checkpoint "
+        "file becomes available with everything processed so far — this "
+        "protects you if the app itself gets interrupted unexpectedly "
+        "(e.g. hitting a platform resource limit on very large sheets). "
+        "Downloading a checkpoint file is safe to do anytime — it won't "
+        "interrupt or slow down the run in progress."
     )
     st.markdown("---")
     with st.expander("Skipped file types (static assets)"):
