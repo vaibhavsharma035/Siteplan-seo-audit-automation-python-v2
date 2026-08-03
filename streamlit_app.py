@@ -16,6 +16,7 @@ from shared_utils import (
     best_match_index,
     new_requests_session,
     build_data_source_ui,
+    build_no_rerun_download_link,
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -40,6 +41,7 @@ DEFAULT_COLUMN_GUESSES = {
 DEFAULT_TIMEOUT = 15
 DEFAULT_DELAY = 1
 DEFAULT_MAX_RETRIES = 3
+DEFAULT_CHECKPOINT_EVERY = 100
 
 # ==========================================================
 # COLORS
@@ -92,6 +94,68 @@ def clean_text(text):
     return " ".join(str(text).replace("\n", " ").replace("\r", " ").split()).strip()
 
 
+def build_formatted_workbook(df):
+    """
+    Builds the formatted, color-coded .xlsx (in memory) from whatever
+    the dataframe currently holds — used both for the final download
+    and for the periodic mid-run checkpoint downloads, so both stay
+    identical in formatting with no duplicated logic.
+    """
+    excel_buffer = io.BytesIO()
+    df.to_excel(excel_buffer, index=False)
+    excel_buffer.seek(0)
+
+    wb = load_workbook(excel_buffer)
+    ws = wb.active
+
+    col_map = {}
+    for cell in ws[1]:
+        if cell.value:
+            col_map[str(cell.value).strip()] = cell.column
+
+    result_columns = [c for c in ["H1_Result", "Title_Result", "Meta_Result"] if c in df.columns]
+    status_column = "Status_Code"
+
+    HEADER_FILL = PatternFill(fill_type="solid", fgColor="1F3864")
+    HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
+    HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    HEADER_BORDER = Border(bottom=Side(style="medium", color="FFFFFF"))
+
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = HEADER_ALIGN
+        cell.border = HEADER_BORDER
+
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 35
+
+    for col in ws.columns:
+        max_length = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max(max_length + 2, 3), 16)
+
+    for row_num in range(2, ws.max_row + 1):
+        for col_name in result_columns:
+            if col_name in col_map:
+                cell = ws.cell(row=row_num, column=col_map[col_name])
+                apply_cell_style(cell, cell.value)
+        if status_column in col_map:
+            cell = ws.cell(row=row_num, column=col_map[status_column])
+            apply_status_style(cell, cell.value)
+
+    output_buffer = io.BytesIO()
+    wb.save(output_buffer)
+    output_buffer.seek(0)
+    return output_buffer
+
+
 # ==========================================================
 # UI — HEADER
 # ==========================================================
@@ -103,11 +167,24 @@ with st.sidebar:
     request_timeout = st.number_input("Request timeout (seconds)", min_value=5, max_value=60, value=DEFAULT_TIMEOUT)
     delay_between_requests = st.number_input("Delay between requests (seconds)", min_value=0.0, max_value=10.0, value=float(DEFAULT_DELAY), step=0.5)
     max_retries = st.number_input("Max retries per URL", min_value=1, max_value=5, value=DEFAULT_MAX_RETRIES)
+    checkpoint_every = st.number_input(
+        "Checkpoint download every N URLs",
+        min_value=10, max_value=1000, value=DEFAULT_CHECKPOINT_EVERY, step=10,
+        help="A downloadable result file, covering everything processed "
+             "so far, refreshes every N URLs. Only the most recent one is "
+             "ever shown — each new checkpoint file replaces the last. "
+             "Lower this for large sheets if you want more frequent "
+             "checkpoints."
+    )
     st.markdown("---")
     st.caption(
-        "A run can't be safely paused and resumed — closing or refreshing "
-        "this tab stops it, and nothing processed so far will be saved. "
-        "For very large sheets, consider checking them in smaller batches."
+        "Runs can't be paused or resumed manually — closing or refreshing "
+        "this tab stops it. But every N URLs (set above), a checkpoint "
+        "file becomes available with everything processed so far — this "
+        "protects you if the app itself gets interrupted unexpectedly "
+        "(e.g. hitting a platform resource limit on very large sheets). "
+        "Downloading a checkpoint file is safe to do anytime — it won't "
+        "interrupt or slow down the run in progress."
     )
 
 # ==========================================================
@@ -273,6 +350,17 @@ if file_bytes is not None and run_clicked:
     # terminal run, showing only the fields actually being checked.
     detail_placeholder = st.empty()
 
+    # Periodic checkpoint download — refreshed every `checkpoint_every`
+    # URLs (set in the sidebar). This exists specifically for
+    # platform-level interruptions (e.g. Streamlit Community Cloud's
+    # resource limits killing the app outright on very large sheets)
+    # that a Python try/finally CANNOT catch, since the process itself
+    # gets terminated from outside — there's no code left running to
+    # react to that. The only real defense is making sure a recent,
+    # downloadable snapshot already exists before that happens, rather
+    # than only building one at the very end.
+    checkpoint_placeholder = st.empty()
+
     for index, row in df.iterrows():
 
         url = row["URL"]
@@ -410,65 +498,26 @@ if file_bytes is not None and run_clicked:
             pass_count += 1
 
         progress_bar.progress((index + 1) / total_urls)
+
+        is_last_row = (index + 1) == total_urls
+        if (index + 1) % checkpoint_every == 0 and not is_last_row:
+            checkpoint_buffer = build_formatted_workbook(df)
+            checkpoint_link_html = build_no_rerun_download_link(
+                checkpoint_buffer.getvalue(),
+                filename=f"{source_name}_SEO_Result_CHECKPOINT_{index + 1}of{total_urls}.xlsx",
+                label=f"⬇ Download progress so far ({index + 1} of {total_urls} processed)",
+            )
+            checkpoint_placeholder.markdown(checkpoint_link_html, unsafe_allow_html=True)
+
         time.sleep(delay_between_requests)
 
     detail_placeholder.code("Done processing all URLs.")
+    checkpoint_placeholder.empty()
 
     # ==========================================================
     # BUILD FORMATTED OUTPUT WORKBOOK (in memory)
     # ==========================================================
-    excel_buffer = io.BytesIO()
-    df.to_excel(excel_buffer, index=False)
-    excel_buffer.seek(0)
-
-    wb = load_workbook(excel_buffer)
-    ws = wb.active
-
-    col_map = {}
-    for cell in ws[1]:
-        if cell.value:
-            col_map[str(cell.value).strip()] = cell.column
-
-    result_columns = [c for c in ["H1_Result", "Title_Result", "Meta_Result"] if c in df.columns]
-    status_column = "Status_Code"
-
-    HEADER_FILL = PatternFill(fill_type="solid", fgColor="1F3864")
-    HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
-    HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    HEADER_BORDER = Border(bottom=Side(style="medium", color="FFFFFF"))
-
-    for cell in ws[1]:
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.alignment = HEADER_ALIGN
-        cell.border = HEADER_BORDER
-
-    ws.freeze_panes = "A2"
-    ws.row_dimensions[1].height = 35
-
-    for col in ws.columns:
-        max_length = 0
-        col_letter = col[0].column_letter
-        for cell in col:
-            try:
-                if cell.value:
-                    max_length = max(max_length, len(str(cell.value)))
-            except Exception:
-                pass
-        ws.column_dimensions[col_letter].width = min(max(max_length + 2, 3), 16)
-
-    for row_num in range(2, ws.max_row + 1):
-        for col_name in result_columns:
-            if col_name in col_map:
-                cell = ws.cell(row=row_num, column=col_map[col_name])
-                apply_cell_style(cell, cell.value)
-        if status_column in col_map:
-            cell = ws.cell(row=row_num, column=col_map[status_column])
-            apply_status_style(cell, cell.value)
-
-    output_buffer = io.BytesIO()
-    wb.save(output_buffer)
-    output_buffer.seek(0)
+    output_buffer = build_formatted_workbook(df)
 
     # ==========================================================
     # SUMMARY + DOWNLOAD
