@@ -9,7 +9,7 @@ Available in two forms:
 - **A hosted web app** (Streamlit) — no installation needed, works in any browser
 - **A local Python script** — for offline/CLI use
 
-🌐 **Live Application:** https://siteplan-seo-audit-automation-python-v2-g9d45dhukap5rprutwx6qv.streamlit.app/
+🌐 **Live Application:**  https://siteplan-seo-audit-automation-python-v2-g9d45dhukap5rprutwx6qv.streamlit.app/
 
 ---
 
@@ -20,7 +20,7 @@ Available in two forms:
 ├── shared_utils.py                ← helpers shared by both web app pages
 ├── pages/
 │   └── 1_Redirect_Checker.py     ← Redirect Checker (web app, second page)
-├── Siteplan_Test_Final.py        ← SEO Checker (local CLI script)
+├── Siteplan_Test.py        ← SEO Checker (local CLI script)
 ├── requirements.txt
 └── README.md
 ```
@@ -45,7 +45,8 @@ sidebar navigation: **SEO Checker** and **Redirect Checker**.
    fixed column names required — works across different clients' sheets).
 5. Click **Run SEO Check**. A live progress bar and per-URL status panel
    show Status Code, H1 Result, Title Result, and Meta Result as each page
-   is checked.
+   is checked — with a periodic checkpoint download available throughout
+   the run (see "Shared behavior" below).
 6. Download the finished, color-coded `.xlsx` report.
 
 ### Redirect Checker
@@ -55,11 +56,15 @@ sidebar navigation: **SEO Checker** and **Redirect Checker**.
    column.
 3. Click **Run Redirect Check**. Each URL is fetched and its final
    destination (after following redirects) is compared against the expected
-   URL.
+   URL — a page must both land on the correct URL *and* return a successful
+   HTTP status to be marked as a pass. A page that returns an error status
+   (e.g. a 404 that never actually redirects anywhere) is marked as a
+   failure even if its URL happens to match the expected one.
 4. Static asset URLs (`.css`, `.js`, images, fonts, `.pdf`, etc.) and blank
    URLs are automatically skipped and marked accordingly.
 5. Download a row-color-coded `.xlsx` report (green = pass, red = fail,
-   orange = error, grey = skipped).
+   orange = error, grey = skipped), including the actual HTTP status code
+   for every URL checked.
 
 ### Shared behavior across both tools
 
@@ -71,9 +76,23 @@ sidebar navigation: **SEO Checker** and **Redirect Checker**.
 - **Nothing is saved to disk on the server** — uploaded files and results
   exist only in your browser session; everything is generated in memory and
   offered as a direct download.
-- **Runs can't be paused/resumed** — closing or refreshing the tab stops a
-  run in progress, and nothing processed so far is retained. For very large
-  sheets, consider checking them in smaller batches.
+- **Runs can't be paused or resumed manually** — closing or refreshing the
+  tab stops a run in progress.
+- **Automatic checkpoint downloads** — every N URLs (configurable in the
+  sidebar, default 100), a downloadable result file becomes available
+  covering everything processed so far. Only the most recent checkpoint is
+  ever shown — each new one replaces the last. This exists specifically to
+  protect against the app itself being interrupted unexpectedly (e.g.
+  hitting Streamlit Community Cloud's resource limits on very large
+  sheets) — a scenario a normal stop/cleanup mechanism can't handle, since
+  the process is terminated from outside. Downloading a checkpoint is safe
+  to do at any time and does **not** interrupt or slow down the run in
+  progress.
+- **Large sheets**: Streamlit Community Cloud's free tier has practical
+  resource limits — in testing, runs have hit interruptions around
+  ~1,000 URLs in a single run. For sheets in that range or larger, either
+  lower the checkpoint frequency (e.g. every 25–50 URLs) for more frequent
+  safety downloads, or split the sheet into smaller batches.
 
 ---
 
